@@ -43,6 +43,7 @@ from readthedocs.core.resolver import resolve_path
 from readthedocs.core.symlink import PublicSymlink, PrivateSymlink
 from readthedocs.core.utils import send_email, broadcast
 from readthedocs.doc_builder.config import load_yaml_config
+from readthedocs.doc_builder.constants import DOCKER_LIMITS
 from readthedocs.doc_builder.environments import (LocalEnvironment,
                                                   DockerEnvironment)
 from readthedocs.doc_builder.exceptions import BuildEnvironmentError
@@ -1011,22 +1012,44 @@ def sync_callback(_, version_pk, commit, *args, **kwargs):
 
 @app.task()
 def finish_inactive_builds():
-    delta = datetime.timedelta(hours=1, minutes=30)
+    """
+    Finish inactive builds.
+
+    A build is consider inactive if it's not in ``FINISHED`` state and it has been
+    "running" for more time that the allowed one (``Project.container_time_limit``
+    or ``DOCKER_LIMITS['time']`` plus a 20% of it).
+
+    These inactive builds will be marked as ``success`` and ``FINISHED`` with an
+    ``error`` to be communicated to the user.
+    """
+    time_limit = int(DOCKER_LIMITS['time'] * 1.2)
+    delta = datetime.timedelta(minutes=time_limit)
     query = (~Q(state=BUILD_STATE_FINISHED) &
              Q(date__lte=datetime.datetime.now() - delta))
 
+    builds_finished = 0
     builds = Build.objects.filter(query)[:50]
     for build in builds:
+
+        if build.project.container_time_limit:
+            custom_delta = datetime.timedelta(
+                minutes=int(build.project.container_time_limit))
+            if build.date + custom_delta > datetime.datetime.now():
+                # Do not mark as FINISHED builds with a custom time limit that wasn't
+                # expired yet (they are still building the project version)
+                continue
+
         build.success = False
         build.state = BUILD_STATE_FINISHED
-        build.error = (
+        build.error = _(
             'This build was terminated due to inactivity. If you '
             'continue to encounter this error, file a support '
             'request with and reference this build id ({0}).'.format(build.pk)
         )
         build.save()
+        builds_finished += 1
 
     log.info(
         'Builds marked as "Terminated due inactivity": %s',
-        builds.count(),
+        builds_finished,
     )
